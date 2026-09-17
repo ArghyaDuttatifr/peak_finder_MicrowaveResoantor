@@ -32,4 +32,4 @@ Your input text files should be structured as comma-separated values (CSV) conta
 ### File Naming Convention
 To enable automatic temperature parsing, include `T_` followed by the temperature value in your filename:
 ```text
-s12_1st_1500_P_-7.0_T_4.505.txt  --> Parsed Temperature: 4.505 K
+test_1500_P_-16.0_T_3.664.txt --> Parsed Temperature: 3.664 K
