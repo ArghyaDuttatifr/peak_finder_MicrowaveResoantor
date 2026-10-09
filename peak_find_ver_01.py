@@ -1,234 +1,204 @@
-import streamlit as st
+# ─────────────────────────────────────────────────────────────────────────────
+#  📈  Microwave Resonator Peak Analysis – fully parallelised version
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --------------------------------------------------------------
+# 1️⃣  IMPORTS
+# --------------------------------------------------------------
+import os
 import re
+from io import BytesIO
+from typing import Any, Dict, List, Tuple
+
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import streamlit as st
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.signal import savgol_filter, find_peaks
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 
-# ===== PAGE CONFIG =====
+# --------------------------------------------------------------
+# 2️⃣  PAGE CONFIG & TITLE
+# --------------------------------------------------------------
 st.set_page_config(page_title="Microwave Resonator Analysis", layout="wide")
 st.title("🧲 Microwave Resonator Peak Analysis")
 
-# ===== SIDEBAR: USER INPUTS =====
-st.sidebar.header("1. Upload Data")
-# Accepts multiple text files directly from your PC
-
-
-
-
-
-#uploaded_files = st.sidebar.file_uploader("Upload all sweep .txt files", accept_multiple_files=True, type=["txt", "csv"])
-# Place this right after st.sidebar.
-#if st.sidebar.button("🗑️ Reset / Clear All Data"):
- #   st.rerun()
-
-# ===== SIDEBAR: USER INPUTS =====
+# --------------------------------------------------------------
+# 3️⃣  SIDEBAR – FILE UPLOADER + PARAMETERS
+# --------------------------------------------------------------
 st.sidebar.header("1. Upload Data")
 
-# Initialize a state key for the uploader if it doesn't exist
+# ---- a)  uploader with a “reset” key ---------------------------------
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 
-# Pass the dynamic key to the uploader
 uploaded_files = st.sidebar.file_uploader(
-    "Upload all sweep .txt files", 
-    accept_multiple_files=True, 
+    "Upload all sweep .txt files",
+    accept_multiple_files=True,
     type=["txt", "csv"],
-    key=f"uploader_{st.session_state['uploader_key']}"
+    key=f"uploader_{st.session_state['uploader_key']}",
 )
 
-# Reset Button: Incrementing the key forces Streamlit to rebuild a clean uploader widget
 if st.sidebar.button("🗑️ Clear All Files", use_container_width=True):
     st.session_state["uploader_key"] += 1
     st.rerun()
 
-
-
-
-
-
-
-
-
-
-
+# ---- b)  analysis parameters -----------------------------------------
 st.sidebar.header("2. Analysis Parameters")
-GAP_FACTOR = st.sidebar.number_input("Gap Factor (Band splitting)", value=100, step=10)
-SMOOTH_WINDOW = st.sidebar.number_input("Smoothing Window (Must be odd)", value=5, step=2, min_value=3)
-SMOOTH_POLY = st.sidebar.number_input("Smoothing Polynomial", value=3, step=1, min_value=1, max_value=SMOOTH_WINDOW-1)
-PROMINENCE = st.sidebar.number_input("Minimum Peak Prominence", value=0.001, step=0.0005, format="%.4f")
+GAP_FACTOR = st.sidebar.number_input(
+    "Gap Factor (Band splitting)", value=100, step=10
+)
+SMOOTH_WINDOW = st.sidebar.number_input(
+    "Smoothing Window (must be odd)", value=5, step=2, min_value=3
+)
+SMOOTH_POLY = st.sidebar.number_input(
+    "Smoothing Polynomial", value=3, step=1, min_value=1, max_value=SMOOTH_WINDOW - 1
+)
+PROMINENCE = st.sidebar.number_input(
+    "Minimum Peak Prominence", value=0.001, step=0.0005, format="%.4f"
+)
 
 PLOT_INDIVIDUAL = st.sidebar.checkbox("Show individual peak plots", value=False)
 
-# ===== FUNCTIONS (Adapted from your code) =====
-def extract_temperature(filename):
-    match = re.search(r"T_([0-9.]+)", filename)
-    if match:
-        return float(match.group(1).rstrip("."))
-    return None
+# --------------------------------------------------------------
+# 4️⃣  PURE‑PYTHON / NUMPY HELPERS (must be top‑level for pickling)
+# --------------------------------------------------------------
+def extract_temperature(fname: str) -> float | None:
+    """Extract temperature from a filename like  …_T_1.23_….txt."""
+    m = re.search(r"T_([0-9.]+)", fname)
+    return float(m.group(1).rstrip(".")) if m else None
 
-def detect_frequency_bands(frequency):
-    df = np.diff(frequency)
-    threshold = GAP_FACTOR * np.median(df)
-    splits = [0]
-    for i in range(1, len(frequency)):
-        if (frequency[i] - frequency[i-1]) > threshold:
-            splits.append(i)
-    splits.append(len(frequency))
-    return splits
 
-def smooth(y):
-    if len(y) < SMOOTH_WINDOW:
-        return y
-    return savgol_filter(y, SMOOTH_WINDOW, SMOOTH_POLY)
+def detect_frequency_bands_np(freq: np.ndarray, gap_factor: float) -> np.ndarray:
+    """
+    Vectorised version of the original band‑split routine.
+    Returns the split indices: [0, idx1, idx2, …, len(freq)].
+    """
+    df = np.diff(freq)
+    thr = gap_factor * np.median(df)
+    splits = np.where(df > thr)[0] + 1
+    return np.concatenate(([0], splits, [len(freq)]))
 
-# ===== MAIN APP LOGIC =====
-if uploaded_files:
-    band_results = {}
-    band_full_data = {}
-    
-    # Extract temperatures and sort files
-    files_with_T = []
-    for file in uploaded_files:
-        T = extract_temperature(file.name)
-        if T is not None:
-            files_with_T.append((T, file))
-            
-    if not files_with_T:
-        st.error("Could not extract temperatures from filenames. Ensure files have 'T_X.XXX' in the name.")
-        st.stop()
-        
-    files_with_T = sorted(files_with_T, key=lambda x: x[0])
-    
-    with st.spinner("Analyzing files..."):
-        for T, file in files_with_T:
-            # Reset file pointer for reading
-            file.seek(0)
-            data = pd.read_csv(file, sep=",")
-            data.columns = [col.strip() for col in data.columns]
-            
-            f = data["Frequency"].values
-            linmag = data["LinMag"].values
-            
-            splits = detect_frequency_bands(f)
-            
-            for band_idx in range(len(splits)-1):
-                start = splits[band_idx]
-                end = splits[band_idx+1]
-                
-                f_band = f[start:end]
-                lm_band = linmag[start:end]
-                lm_smooth = smooth(lm_band)
-                
-                # Store full data
-                if band_idx not in band_full_data:
-                    band_full_data[band_idx] = []
-                    
-                band_full_data[band_idx].append({
-                    "T": T,
-                    "f": f_band / 1e9,      # GHz
-                    "linmag": lm_band,
-                    "smooth": lm_smooth,
-                    "filename": file.name
-                })
-                
-                peaks, _ = find_peaks(lm_smooth, prominence=PROMINENCE)
-                
-                if len(peaks) == 0:
-                    continue
-                    
-                # Choose strongest peak
-                peak_idx = peaks[np.argmax(lm_smooth[peaks])]
-                f0 = f_band[peak_idx] / 1e9  # GHz
-                
-                if band_idx not in band_results:
-                    band_results[band_idx] = {"T": [], "f": []}
-                    
-                band_results[band_idx]["T"].append(T)
-                band_results[band_idx]["f"].append(f0)
-                
-                # Optional: Plot Individual scans
-                if PLOT_INDIVIDUAL:
-                    fig, ax = plt.subplots(figsize=(6, 4))
-                    ax.plot(f_band/1e9, lm_band, color='blue', alpha=0.5, label="Raw")
-                    ax.plot(f_band/1e9, lm_smooth, color='orange', label="Smooth")
-                    ax.axvline(f0, color='red', linestyle="--")
-                    ax.text(f0+0.001, lm_smooth[peak_idx], f"f = {f0:.6f} GHz\nT = {T:.3f} K", color="red")
-                    ax.set_xlabel("Frequency (GHz)")
-                    ax.set_ylabel("LinMag")
-                    ax.set_title(f"{file.name} | Band {band_idx+1}")
-                    ax.legend()
-                    st.pyplot(fig)
-                    plt.close(fig) # Keep memory clean
 
-        st.success(f"Successfully processed {len(files_with_T)} sweeps across {len(band_full_data)} frequency bands.")
+def smooth_signal(y: np.ndarray, win: int, poly: int) -> np.ndarray:
+    """Savitzky‑Golay smoothing (fallback to raw data if too short)."""
+    return y if len(y) < win else savgol_filter(y, win, poly)
 
-        # ============================================================
-        # VISUALIZATION: TABS FOR CLEAN ORGANIZATION
-        # ============================================================
-        tab1, tab2 = st.tabs(["🌈 Sweep Colormaps", "📈 f vs T Trends"])
-        
-        with tab1:
-            st.subheader("Frequency Sweeps Over Temperature")
-            cols = st.columns(min(len(band_full_data), 3)) # Max 3 plots per row
-            
-            for idx, (band_idx, dataset) in enumerate(band_full_data.items()):
-                fig, ax = plt.subplots(figsize=(6, 5))
-                dataset = sorted(dataset, key=lambda x: x["T"])
-                temps = np.array([entry["T"] for entry in dataset])
-                
-                norm = mcolors.Normalize(vmin=temps.min(), vmax=temps.max())
-                cmap = cm.viridis
-                
-                for entry in dataset:
-                    color = cmap(norm(entry["T"]))
-                    ax.plot(entry["f"], entry["linmag"], color=color, linewidth=0.8)
-                    
-                ax.set_xlabel("Frequency (GHz)")
-                ax.set_ylabel("LinMag")
-                ax.set_title(f"Band {band_idx + 1}")
-                ax.grid(True, alpha=0.3)
-                
-                sm = cm.ScalarMappable(norm=norm, cmap=cmap)
-                sm.set_array([])
-                fig.colorbar(sm, ax=ax, label="Temperature (K)")
-                
-                cols[idx % 3].pyplot(fig)
-                plt.close(fig)
 
-        with tab2:
-            st.subheader("Extracted Resonance vs Temperature")
-            cols = st.columns(min(len(band_results), 3))
-            
-            for idx, band_idx in enumerate(band_results):
-                if len(band_results[band_idx]["T"]) == 0:
-                    continue
-                    
-                T_vals = band_results[band_idx]["T"]
-                f_vals = band_results[band_idx]["f"]
-                
-                sorted_pairs = sorted(zip(T_vals, f_vals))
-                T_sorted, f_sorted = zip(*sorted_pairs)
-                
-                fig, ax = plt.subplots(figsize=(6, 4))
-                ax.plot(T_sorted, f_sorted, marker='o', linestyle='-', color='#d62728')
-                ax.set_xlabel("Temperature (K)")
-                ax.set_ylabel("Resonance Frequency (GHz)")
-                ax.set_title(f"Band {band_idx+1}")
-                ax.grid(True, linestyle="--", alpha=0.7)
-                
-                cols[idx % 3].pyplot(fig)
-                plt.close(fig)
-                
-                # Add a download button for this specific band's results
-                csv_data = pd.DataFrame({"Temperature (K)": T_sorted, "Frequency (GHz)": f_sorted}).to_csv(index=False)
-                cols[idx % 3].download_button(
-                    label=f"Download Band {band_idx+1} Results",
-                    data=csv_data,
-                    file_name=f"Band_{band_idx+1}_f_vs_T.csv",
-                    mime="text/csv"
-                )
-else:
-    st.info("👈 Upload your data folder files in the sidebar to begin processing.")
+def process_one_file(
+    file_bytes: bytes,
+    filename: str,
+    params: Dict[str, Any],
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """
+    **Runs in a separate process**.
+    Returns:
+        temperature (float)
+        list of per‑band dictionaries:
+            {
+                "band_idx": int,
+                "f_GHz": np.ndarray,
+                "linmag": np.ndarray,
+                "smooth": np.ndarray,
+                "peak_fGHz": float,
+                "peak_idx": int,
+            }
+    """
+    # ----- read CSV from the raw bytes ---------------------------------
+    buf = BytesIO(file_bytes)
+    df = pd.read_csv(buf, sep=",")
+    df.columns = [c.strip() for c in df.columns]
+
+    f = df["Frequency"].values.astype(np.float64)
+    linmag = df["LinMag"].values.astype(np.float64)
+
+    # ----- band detection ------------------------------------------------
+    splits = detect_frequency_bands_np(f, params["gap_factor"])
+
+    bands = []
+    for band_idx in range(len(splits) - 1):
+        start, end = splits[band_idx], splits[band_idx + 1]
+        f_band = f[start:end]
+        lm_band = linmag[start:end]
+
+        # smoothing
+        lm_smooth = smooth_signal(lm_band, params["smooth_window"], params["smooth_poly"])
+
+        # peak detection
+        peaks, _ = find_peaks(lm_smooth, prominence=params["prominence"])
+        if len(peaks) == 0:
+            # No peak in this band → skip it
+            continue
+        # strongest peak
+        strongest = peaks[np.argmax(lm_smooth[peaks])]
+        peak_fGHz = f_band[strongest] / 1e9
+
+        bands.append(
+            {
+                "band_idx": band_idx,
+                "f_GHz": f_band / 1e9,
+                "linmag": lm_band,
+                "smooth": lm_smooth,
+                "peak_fGHz": peak_fGHz,
+                "peak_idx": strongest,
+            }
+        )
+
+    temperature = extract_temperature(filename)
+    return temperature, bands
+
+
+# --------------------------------------------------------------
+# 5️⃣  PARALLEL DRIVER (cached)
+# --------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def run_parallel_analysis(
+    file_info: List[Tuple[str, bytes]],
+    params: Dict[str, Any],
+) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[int, Dict[str, List[float]]]]:
+    """
+    Executes `process_one_file` for every uploaded file on a pool of workers.
+    Returns two structures that are **exactly what the original script expected**:
+
+    * `band_full_data[band_idx]` → list of dicts with raw + smooth data.
+    * `band_results[band_idx]` → {"T": [...], "f": [...]}  (peak frequencies vs T)
+    """
+    band_full_data: Dict[int, List[Dict[str, Any]]] = {}
+    band_results: Dict[int, Dict[str, List[float]]] = {}
+
+    # ----------------------------------------------------------
+    #   Use as many processes as there are physical cores
+    # ----------------------------------------------------------
+    max_workers = os.cpu_count() or 1
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {
+            executor.submit(process_one_file, bts, fname, params): (fname, bts)
+            for fname, bts in file_info
+        }
+
+        for fut in as_completed(future_to_file):
+            fname, _ = future_to_file[fut]
+            try:
+                temperature, band_list = fut.result()
+            except Exception as exc:
+                st.error(f"⚠️  Problem processing *{fname}*: {exc}")
+                continue
+
+            if temperature is None:
+                st.warning(f"⚠️  Could not read temperature from *{fname}* – skipping.")
+                continue
+
+            for band in band_list:
+                idx = band["band_idx"]
+
+                # ----- store the full trace (for the colormap view) ----------
+                if idx not in band_full_data:
+                    band_full_data[idx] = []
+                band_full_data[idx].append(
+                    {
+                        "T": temperature,
+                        "f": band["f_GHz"],
+                        "linmag": band["linmag"],
+                        "smooth": band["smooth"],
